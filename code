@@ -1,0 +1,1098 @@
+// ============================================================
+// Battlesnake AI v4 - Full TypeScript Implementation
+// ============================================================
+
+// ---- Type Definitions ----
+
+export interface Coord {
+  x: number;
+  y: number;
+}
+
+export enum FoodType {
+  Bun = 1,   // health+40 length+1
+  Peach = 2, // health+100 length+3
+  Spider = 3 // health-60 length+1
+}
+
+export type Food = Coord & { value: FoodType };
+
+export interface Battlesnake {
+  id: string;
+  name: string;
+  health: number;
+  body: Coord[];
+  head: Coord;
+  length: number;
+  latency: string;
+  shout: string;
+  customizations: Customizations;
+}
+
+export interface Customizations {
+  color: string;
+  head: string;
+  tail: string;
+}
+
+export interface Board {
+  height: number;
+  width: number;
+  food: Food[];
+  hazards: Coord[];
+  snakes: Battlesnake[];
+}
+
+export interface GameState {
+  game: Game;
+  turn: number;
+  board: Board;
+  you: Battlesnake;
+}
+
+export interface Game {
+  id: string;
+  ruleset: Ruleset;
+  map: string;
+  source: string;
+  timeout: number;
+}
+
+export interface Ruleset {
+  name: string;
+  version: string;
+  settings: RulesetSettings;
+}
+
+export interface RulesetSettings {
+  foodSpawnChance: number;
+  minimumFood: number;
+  hazardDamagePerTurn: number;
+}
+
+export interface InfoResponse {
+  apiversion: string;
+  author?: string;
+  name?: string;
+  color?: string;
+  head?: string;
+  tail?: string;
+  version?: string;
+}
+
+export interface MoveResponse {
+  move: string;
+  shout?: string;
+}
+
+// ---- Core Data Structures ----
+
+const DIRS: Record<string, { dx: number; dy: number }> = {
+  up:    { dx: 0,  dy: 1  },
+  down:  { dx: 0,  dy: -1 },
+  left:  { dx: -1, dy: 0  },
+  right: { dx: 1,  dy: 0  },
+};
+
+function key(c: Coord): string {
+  return `${c.x},${c.y}`;
+}
+
+function eq(a: Coord, b: Coord): boolean {
+  return a.x === b.x && a.y === b.y;
+}
+
+function manhattan(a: Coord, b: Coord): number {
+  return Math.abs(a.x - b.x) + Math.abs(a.y - b.y);
+}
+
+// ---- Obstacle Calculation ----
+
+function buildObstacles(gameState: GameState, excludeHead?: Coord): Set<string> {
+  const obs = new Set<string>();
+  for (const snake of gameState.board.snakes) {
+    for (let i = 0; i < snake.body.length; i++) {
+      const seg = snake.body[i];
+      // Skip own head if excludeHead matches
+      if (excludeHead && eq(seg, excludeHead)) continue;
+      // Skip tail segments (they'll move away next turn)
+      // The tail is the last segment; if the snake has no food pending (length unchanged),
+      // the tail will vacate. We skip tails of all snakes.
+      if (i === snake.body.length - 1) continue;
+      obs.add(key(seg));
+    }
+  }
+  return obs;
+}
+
+function inBounds(c: Coord, board: Board): boolean {
+  return c.x >= 0 && c.x < board.width && c.y >= 0 && c.y < board.height;
+}
+
+// ---- BFS Flood Fill ----
+
+function floodFill(start: Coord, obstacles: Set<string>, board: Board): number {
+  if (!inBounds(start, board) || obstacles.has(key(start))) return 0;
+  const visited = new Set<string>();
+  const queue: Coord[] = [start];
+  visited.add(key(start));
+  while (queue.length > 0) {
+    const cur = queue.shift()!;
+    for (const d of Object.values(DIRS)) {
+      const nb: Coord = { x: cur.x + d.dx, y: cur.y + d.dy };
+      const k = key(nb);
+      if (inBounds(nb, board) && !obstacles.has(k) && !visited.has(k)) {
+        visited.add(k);
+        queue.push(nb);
+      }
+    }
+  }
+  return visited.size;
+}
+
+function floodFillSet(start: Coord, obstacles: Set<string>, board: Board): Set<string> {
+  const visited = new Set<string>();
+  if (!inBounds(start, board) || obstacles.has(key(start))) return visited;
+  const queue: Coord[] = [start];
+  visited.add(key(start));
+  while (queue.length > 0) {
+    const cur = queue.shift()!;
+    for (const d of Object.values(DIRS)) {
+      const nb: Coord = { x: cur.x + d.dx, y: cur.y + d.dy };
+      const k = key(nb);
+      if (inBounds(nb, board) && !obstacles.has(k) && !visited.has(k)) {
+        visited.add(k);
+        queue.push(nb);
+      }
+    }
+  }
+  return visited;
+}
+
+function bfsDistance(start: Coord, target: Coord, obstacles: Set<string>, board: Board): number {
+  if (eq(start, target)) return 0;
+  if (!inBounds(start, board) || !inBounds(target, board)) return 999;
+  const visited = new Set<string>();
+  const queue: Array<{ c: Coord; dist: number }> = [{ c: start, dist: 0 }];
+  visited.add(key(start));
+  while (queue.length > 0) {
+    const { c: cur, dist } = queue.shift()!;
+    for (const d of Object.values(DIRS)) {
+      const nb: Coord = { x: cur.x + d.dx, y: cur.y + d.dy };
+      const k = key(nb);
+      if (!inBounds(nb, board) || visited.has(k)) continue;
+      if (eq(nb, target)) return dist + 1;
+      if (!obstacles.has(k)) {
+        visited.add(k);
+        queue.push({ c: nb, dist: dist + 1 });
+      }
+    }
+  }
+  return 999;
+}
+
+// ---- Food Helpers ----
+
+function isGoodFood(f: Food): boolean {
+  return f.value === FoodType.Bun || f.value === FoodType.Peach;
+}
+
+function foodHealthGain(f: Food): number {
+  return f.value === FoodType.Bun ? 40 : f.value === FoodType.Peach ? 100 : -60;
+}
+
+function foodLengthGain(f: Food): number {
+  return f.value === FoodType.Peach ? 3 : 1;
+}
+
+// ---- Find food at coord ----
+
+function foodAt(c: Coord, board: Board): Food | undefined {
+  return board.food.find(f => eq(f, c));
+}
+
+// ---- Get neighbors (in-bounds) ----
+
+function neighbors(c: Coord, board: Board): Coord[] {
+  const result: Coord[] = [];
+  for (const d of Object.values(DIRS)) {
+    const nb: Coord = { x: c.x + d.dx, y: c.y + d.dy };
+    if (inBounds(nb, board)) result.push(nb);
+  }
+  return result;
+}
+
+// ---- Minimax ----
+
+function minimaxEval(
+  mySnake: Battlesnake,
+  enemies: Battlesnake[],
+  board: Board
+): number {
+  const obs = new Set<string>();
+  // Build obstacles from current state (simplified: all bodies except tails)
+  for (const snake of [mySnake, ...enemies]) {
+    for (let i = 0; i < snake.body.length - 1; i++) {
+      obs.add(key(snake.body[i]));
+    }
+  }
+  const mySpace = floodFill(mySnake.head, obs, board);
+  let score = mySpace * 1.5;
+  for (const enemy of enemies) {
+    const eSpace = floodFill(enemy.head, obs, board);
+    score -= eSpace * 0.5;
+    if (mySnake.length > enemy.length) score += 100;
+    else if (mySnake.length < enemy.length) score -= 100;
+  }
+  return score;
+}
+
+function minimax(
+  mySnake: Battlesnake,
+  enemies: Battlesnake[],
+  board: Board,
+  depth: number,
+  alpha: number,
+  beta: number,
+  isMyTurn: boolean,
+  turn: number
+): number {
+  if (depth === 0) {
+    return minimaxEval(mySnake, enemies, board);
+  }
+
+  // Build obstacles
+  const obs = new Set<string>();
+  for (const snake of [mySnake, ...enemies]) {
+    for (let i = 0; i < snake.body.length - 1; i++) {
+      obs.add(key(snake.body[i]));
+    }
+  }
+
+  if (isMyTurn) {
+    let best = -Infinity;
+    for (const d of Object.values(DIRS)) {
+      const next: Coord = { x: mySnake.head.x + d.dx, y: mySnake.head.y + d.dy };
+      if (!inBounds(next, board) || obs.has(key(next))) {
+        // Death
+        const deathScore = -9000 - depth * 100;
+        if (deathScore > best) best = deathScore;
+        alpha = Math.max(alpha, best);
+        if (beta <= alpha) break;
+        continue;
+      }
+      // Simulate move
+      const newBody = [next, ...mySnake.body.slice(0, -1)];
+      const newSnake: Battlesnake = {
+        ...mySnake,
+        head: next,
+        body: newBody,
+        health: mySnake.health - 1,
+        length: mySnake.length,
+      };
+      const val = minimax(newSnake, enemies, board, depth - 1, alpha, beta, false, turn + 1);
+      if (val > best) best = val;
+      alpha = Math.max(alpha, best);
+      if (beta <= alpha) break;
+    }
+    return best === -Infinity ? -9000 - depth * 100 : best;
+  } else {
+    // Enemies move (use first enemy for simplicity, could be extended)
+    if (enemies.length === 0) {
+      return minimax(mySnake, enemies, board, depth - 1, alpha, beta, true, turn + 1);
+    }
+    let worst = Infinity;
+    const enemy = enemies[0];
+    const restEnemies = enemies.slice(1);
+    for (const d of Object.values(DIRS)) {
+      const next: Coord = { x: enemy.head.x + d.dx, y: enemy.head.y + d.dy };
+      if (!inBounds(next, board) || obs.has(key(next))) {
+        // Enemy dies - good for us
+        const val = minimax(mySnake, restEnemies, board, depth - 1, alpha, beta, true, turn + 1);
+        if (val < worst) worst = val;
+        beta = Math.min(beta, worst);
+        if (beta <= alpha) break;
+        continue;
+      }
+      const newBody = [next, ...enemy.body.slice(0, -1)];
+      const newEnemy: Battlesnake = {
+        ...enemy,
+        head: next,
+        body: newBody,
+        health: enemy.health - 1,
+        length: enemy.length,
+      };
+      const val = minimax(mySnake, [newEnemy, ...restEnemies], board, depth - 1, alpha, beta, true, turn + 1);
+      if (val < worst) worst = val;
+      beta = Math.min(beta, worst);
+      if (beta <= alpha) break;
+    }
+    return worst === Infinity
+      ? minimax(mySnake, enemies, board, depth - 1, alpha, beta, true, turn + 1)
+      : worst;
+  }
+}
+
+// ---- Main Scoring Function ----
+
+function scoreMove(dir: string, gameState: GameState): number {
+  const { board, you, turn } = gameState;
+  const d = DIRS[dir];
+  const myHead = you.head;
+  const myLength = you.length;
+  const health = you.health;
+
+  const next: Coord = { x: myHead.x + d.dx, y: myHead.y + d.dy };
+
+  // ---- Fatal Safety Checks ----
+
+  // 1. Out of bounds
+  if (!inBounds(next, board)) return -1e9;
+
+  // Build obstacles (exclude my own head since that's where I came from)
+  const obstacles = buildObstacles(gameState, myHead);
+
+  // 2. Hit obstacle
+  if (obstacles.has(key(next))) return -1e9;
+
+  // 3. Spider death
+  const nextFood = foodAt(next, board);
+  if (nextFood && nextFood.value === FoodType.Spider) {
+    const afterHealth = health - 1 - 60;
+    if (afterHealth <= 0) return -1e9;
+  }
+
+  let score = 0;
+
+  // 4. Head-on collision check
+  const enemies = board.snakes.filter(s => s.id !== you.id);
+  for (const enemy of enemies) {
+    // Check if next is a cell an enemy head can reach in one step
+    for (const ed of Object.values(DIRS)) {
+      const enemyNext: Coord = { x: enemy.head.x + ed.dx, y: enemy.head.y + ed.dy };
+      if (eq(enemyNext, next)) {
+        if (enemy.length >= myLength) {
+          return -1e9;
+        } else {
+          // Non-fatal: we're longer
+          const delta = myLength - enemy.length;
+          score += Math.min(2000 + delta * 200, 4000);
+        }
+      }
+    }
+  }
+
+  // Equal-length head-on
+  for (const enemy of enemies) {
+    if (manhattan(enemy.head, next) === 1 && enemy.length === myLength) {
+      score -= 8000;
+    }
+  }
+
+  // ---- Module 1: One-step lookahead safety ----
+
+  // After moving to next, compute safe exits from next
+  const obsAfterMove = new Set(obstacles);
+  // Add next as occupied (we'll be there), but we need to remove old head
+  // Actually, for lookahead: after moving to next, my head is at next, body shifts
+  // The cell where myHead was becomes part of body (not an obstacle for this purpose unless neck)
+  // Let's compute obstacles as if we moved: add myHead to obstacles, remove tail of self
+  const obsAfterMoveFull = buildObstaclesAfterMove(gameState, next);
+
+  let safeExits = 0;
+  let singleExitDir: Coord | null = null;
+  for (const nd of Object.values(DIRS)) {
+    const nb: Coord = { x: next.x + nd.dx, y: next.y + nd.dy };
+    if (inBounds(nb, board) && !obsAfterMoveFull.has(key(nb))) {
+      safeExits++;
+      singleExitDir = nb;
+    }
+  }
+
+  if (safeExits === 0) {
+    score -= 9500;
+  } else if (safeExits === 1 && singleExitDir !== null) {
+    const depth = floodFill(singleExitDir, obsAfterMoveFull, board);
+    if (depth >= myLength * 6) {
+      // No penalty
+    } else if (depth >= myLength * 4) {
+      score -= 1500;
+    } else if (depth >= myLength * 2) {
+      score -= 3000;
+    } else {
+      score -= 6000;
+    }
+  }
+
+  const reachableFromNext = floodFill(next, obsAfterMoveFull, board);
+  if (reachableFromNext < myLength * 2) {
+    score -= 2000;
+  }
+
+  // ---- Module 2: Spider Strategy ----
+
+  if (nextFood && nextFood.value === FoodType.Spider) {
+    const afterHealth = health - 1 - 60;
+    // Search for good food within 3 BFS steps of spider
+    let hasCombo = false;
+    let bestComboHealth = afterHealth;
+    for (const f of board.food) {
+      if (!isGoodFood(f)) continue;
+      const dist = bfsDistance(next, f, obsAfterMoveFull, board);
+      if (dist <= 3) {
+        hasCombo = true;
+        const comboHealth = afterHealth - dist + foodHealthGain(f);
+        if (comboHealth > bestComboHealth) bestComboHealth = comboHealth;
+      }
+    }
+
+    if (hasCombo) {
+      if (bestComboHealth > health) score += 700;
+      else if (bestComboHealth >= 40) score += 300;
+      // else 0
+    } else {
+      if (afterHealth <= 15) score -= 8000;
+      else if (afterHealth <= 30) score -= 3000;
+      else if (afterHealth > 60) {
+        // Check if good food within 10 steps
+        let nearGoodFood = false;
+        for (const f of board.food) {
+          if (!isGoodFood(f)) continue;
+          const dist = bfsDistance(next, f, obsAfterMoveFull, board);
+          if (dist <= 10) { nearGoodFood = true; break; }
+        }
+        if (nearGoodFood) score += 200;
+      } else {
+        // 31~60
+        score -= 800;
+      }
+    }
+  }
+
+  // ---- Module 3: Space Control ----
+
+  const reachable = reachableFromNext; // already computed
+  score += reachable * 2;
+  if (reachable < myLength * 2) {
+    score -= 2000;
+  }
+
+  // ---- Module 4: Food Strategy ----
+
+  if (nextFood && isGoodFood(nextFood)) {
+    if (health <= 10) {
+      score += nextFood.value === FoodType.Peach ? 8000 : 6000;
+    } else {
+      const newLength = myLength + foodLengthGain(nextFood);
+      // Simulate space after eating (length increases)
+      if (reachable < newLength) {
+        score -= 5000;
+      } else if (reachable < newLength * 2) {
+        score += nextFood.value === FoodType.Peach ? 300 : 100;
+      } else {
+        score += nextFood.value === FoodType.Peach ? 1500 : 800;
+      }
+    }
+  }
+
+  // Move toward nearest 3 good foods
+  const goodFoods = board.food.filter(isGoodFood);
+  const foodsByDist: Array<{ f: Food; dist: number }> = goodFoods
+    .map(f => ({ f, dist: bfsDistance(next, f, obsAfterMoveFull, board) }))
+    .sort((a, b) => a.dist - b.dist)
+    .slice(0, 3);
+
+  let weight: number;
+  if (health < 30) {
+    weight = 25 + (100 - health) * 3;
+  } else if (health < 60) {
+    weight = 8;
+  } else {
+    weight = 3;
+  }
+
+  for (const { f, dist } of foodsByDist) {
+    if (dist < 999) {
+      score += (150 - dist) * weight * 1.18;
+      if (dist <= 10) {
+        score += 300 / (dist + 1);
+      }
+    }
+  }
+
+  // ---- Module 5: Combat Strategy ----
+
+  const myReachable = reachable;
+  for (const enemy of enemies) {
+    // Body proximity penalty
+    for (const seg of enemy.body) {
+      if (manhattan(seg, myHead) <= 2) {
+        score -= 150;
+        break;
+      }
+    }
+
+    const enemyLen = enemy.length;
+    const headDist = manhattan(enemy.head, next);
+    const enemyObstacles = buildObstacles(gameState);
+    const enemyReachable = floodFill(enemy.head, enemyObstacles, board);
+
+    if (myLength > enemyLen) {
+      if (headDist <= 3) {
+        score += Math.min(800, (myLength - enemyLen) * 100);
+      }
+      if (enemyReachable < enemyLen * 2) {
+        score += 150;
+      }
+    } else if (myLength === enemyLen) {
+      if (headDist <= 2) score -= 300;
+    } else {
+      // Enemy longer
+      if (headDist <= 2) {
+        score -= 200;
+        if (enemyReachable > myReachable) score -= 80;
+      }
+    }
+  }
+
+  // ---- Module 6: Center Control (first 50 turns) ----
+
+  if (turn <= 50) {
+    const center: Coord = { x: (board.width - 1) / 2, y: (board.height - 1) / 2 };
+    score += Math.max(0, 20 - manhattan(next, center));
+  }
+
+  // ---- Module 7: Dead-end Detection ----
+
+  if (!nextFood) {
+    let obstacleNeighbors = 0;
+    for (const nd of Object.values(DIRS)) {
+      const nb: Coord = { x: next.x + nd.dx, y: next.y + nd.dy };
+      if (!inBounds(nb, board) || obstacles.has(key(nb))) {
+        obstacleNeighbors++;
+      }
+    }
+    if (obstacleNeighbors >= 3) score -= 600;
+  }
+
+  // ---- Advanced Tactics ----
+
+  const currentSpace = floodFill(myHead, obstacles, board);
+  const afterSpace = reachableFromNext;
+
+  // Tactic 1: Self-trap warning
+  {
+    const ratio = afterSpace / (currentSpace || 1);
+    if (afterSpace < myLength) {
+      score -= 5000;
+    } else if (afterSpace < myLength * 2) {
+      score -= 3000;
+    } else if (currentSpace < myLength * 8) {
+      // Tight
+      if (ratio < 0.35) score -= 5000;
+      else if (ratio < 0.55) score -= 2500;
+    } else {
+      // Loose
+      if (ratio < 0.20) score -= 5000;
+      else if (ratio < 0.35) score -= 2000;
+    }
+  }
+
+  // Tactic 2: Encircle weak enemies (myLength > 6)
+  if (myLength > 6) {
+    for (const enemy of enemies) {
+      const dist = manhattan(myHead, enemy.head);
+      if (enemy.length <= myLength - 2 && dist <= 8) {
+        // Count enemy exits before and after our move
+        const enemyExitsBefore = countSafeExits(enemy.head, obstacles, board);
+        const obsAfter = new Set(obsAfterMoveFull);
+        const enemyExitsAfter = countSafeExits(enemy.head, obsAfter, board);
+
+        if (enemyExitsAfter === 0) score += 1000;
+        else if (enemyExitsAfter === 1) score += 600;
+        const reduction = enemyExitsBefore - enemyExitsAfter;
+        if (reduction > 0) score += reduction * 300;
+      }
+    }
+  }
+
+  // Tactic 3: Escape detection
+  {
+    const nearEnemies = enemies.filter(e => manhattan(e.head, myHead) <= 8);
+    if (afterSpace < myLength * 4 || enemies.length >= 2) {
+      const allDirSpaces: Record<string, number> = {};
+      for (const [dName, dv] of Object.entries(DIRS)) {
+        const nb: Coord = { x: myHead.x + dv.dx, y: myHead.y + dv.dy };
+        allDirSpaces[dName] = inBounds(nb, board) && !obstacles.has(key(nb))
+          ? floodFill(nb, obsAfterMoveFull, board)
+          : 0;
+      }
+      const maxSpace = Math.max(...Object.values(allDirSpaces));
+      if (allDirSpaces[dir] === maxSpace && afterSpace > currentSpace) {
+        score += nearEnemies.length >= 2 ? 800 : 400;
+      }
+      if (afterSpace < maxSpace / 2 && nearEnemies.length > 0) {
+        score -= 200;
+      }
+    }
+  }
+
+  // Tactic 4: Territory control (turn > 30, enemy within 8)
+  if (turn > 30) {
+    const nearEnemies = enemies.filter(e => manhattan(e.head, myHead) <= 8);
+    if (nearEnemies.length > 0) {
+      const territory = computeTerritoryScore(next, nearEnemies, obsAfterMoveFull, board);
+      score += territory;
+    }
+  }
+
+  // Tactic 5: Chase own tail (when space is tight, myLength >= 4)
+  if (myLength >= 4 && afterSpace < myLength * 4) {
+    const tailPos = you.body[you.body.length - 1];
+    const distToTail = bfsDistance(next, tailPos, obsAfterMoveFull, board);
+    if (distToTail <= myLength) score += 80;
+  }
+
+  // Tactic 6: Food competition
+  if (enemies.length > 0) {
+    for (const f of board.food) {
+      if (!isGoodFood(f)) continue;
+      const myDist = bfsDistance(next, f, obsAfterMoveFull, board);
+      if (myDist >= 999) continue;
+
+      let threatDist = 999;
+      let weakCompetitor = false;
+      for (const enemy of enemies) {
+        const eDist = bfsDistance(enemy.head, f, obstacles, board);
+        if (enemy.length >= myLength - 2) {
+          if (eDist < threatDist) threatDist = eDist;
+        } else {
+          if (eDist < myDist) weakCompetitor = true;
+        }
+      }
+
+      if (threatDist < 999) {
+        if (myDist <= threatDist - 2) score += 200;
+        else if (myDist >= threatDist + 2) score -= 60;
+      } else {
+        score += 100;
+      }
+
+      if (weakCompetitor && myDist < bfsDistance(myHead, f, obstacles, board)) {
+        score += 150;
+      }
+    }
+  }
+
+  // Tactic 7: Space splitting (myLength > 7, enemy within 8)
+  if (myLength > 7) {
+    const nearEnemies = enemies.filter(e => manhattan(e.head, myHead) <= 8);
+    if (nearEnemies.length > 0) {
+      const splitObs = new Set(obsAfterMoveFull);
+      const myReachSet = floodFillSet(next, splitObs, board);
+
+      for (const enemy of nearEnemies) {
+        if (!myReachSet.has(key(enemy.head))) {
+          // Enemy is cut off
+          const enemySpace = floodFill(enemy.head, splitObs, board);
+          if (myReachSet.size > enemySpace * 1.5) {
+            score += Math.min(500, 250 + (myReachSet.size - enemySpace * 1.5) * 2);
+          }
+        }
+      }
+    }
+  }
+
+  // Tactic 8: Space decay detection
+  if (afterSpace < myLength * 4) {
+    // Simulate 3 steps
+    let simSpace = afterSpace;
+    let decayCount = 0;
+    let simHead = next;
+    const simObs = new Set(obsAfterMoveFull);
+
+    for (let step = 0; step < 3; step++) {
+      let bestNextSpace = 0;
+      let bestNextHead = simHead;
+      for (const dv of Object.values(DIRS)) {
+        const nb: Coord = { x: simHead.x + dv.dx, y: simHead.y + dv.dy };
+        if (inBounds(nb, board) && !simObs.has(key(nb))) {
+          const sp = floodFill(nb, simObs, board);
+          if (sp > bestNextSpace) {
+            bestNextSpace = sp;
+            bestNextHead = nb;
+          }
+        }
+      }
+      if (step === 0 && simSpace - bestNextSpace > myLength * 2) {
+        score -= 2500;
+      }
+      if (bestNextSpace < simSpace && simSpace - bestNextSpace > myLength) {
+        decayCount++;
+      }
+      simObs.add(key(simHead));
+      simSpace = bestNextSpace;
+      simHead = bestNextHead;
+    }
+    if (decayCount >= 2) score -= 5000;
+  }
+
+  // Tactic 9: Dangerous neighbor evaluation
+  {
+    for (const enemy of enemies) {
+      if (enemy.length >= myLength) {
+        const distToNext = manhattan(enemy.head, next);
+        if (distToNext <= 1) score -= 400;
+      }
+    }
+    const bigSnakesNear3 = enemies.filter(e => e.length >= myLength && manhattan(e.head, next) <= 3);
+    if (bigSnakesNear3.length >= 2) score -= 300;
+    else if (bigSnakesNear3.length === 1) score -= 100;
+  }
+
+  // Tactic 10: Head path conflict
+  if (enemies.length > 0) {
+    for (const enemy of enemies) {
+      // Check if next is reachable by enemy in 1 step
+      let enemyCanReachNext = false;
+      for (const ed of Object.values(DIRS)) {
+        const eb: Coord = { x: enemy.head.x + ed.dx, y: enemy.head.y + ed.dy };
+        if (eq(eb, next)) { enemyCanReachNext = true; break; }
+      }
+      if (enemyCanReachNext && enemy.length >= myLength) {
+        if (enemy.length > myLength) score -= 600;
+        else score -= 300;
+      }
+
+      // Check if next is within 2 steps of a big snake
+      if (enemy.length >= myLength && !enemyCanReachNext) {
+        // BFS 2 from enemy head
+        for (const ed1 of Object.values(DIRS)) {
+          const eb1: Coord = { x: enemy.head.x + ed1.dx, y: enemy.head.y + ed1.dy };
+          if (!inBounds(eb1, board)) continue;
+          for (const ed2 of Object.values(DIRS)) {
+            const eb2: Coord = { x: eb1.x + ed2.dx, y: eb1.y + ed2.dy };
+            if (eq(eb2, next)) { score -= 100; break; }
+          }
+        }
+      }
+    }
+  }
+
+  // Tactic 11: Dense food area
+  {
+    const nearGoodFoods = board.food.filter(f => isGoodFood(f) && manhattan(next, f) <= 3);
+    if (nearGoodFoods.length >= 2) {
+      const bigSnakeNear = enemies.some(e => e.length >= myLength && manhattan(e.head, next) <= 4);
+      let weightedSum = 0;
+      for (const f of nearGoodFoods) {
+        weightedSum += foodHealthGain(f) / (manhattan(next, f) + 1);
+      }
+      score += weightedSum * (bigSnakeNear ? 1 : 3);
+    }
+  }
+
+  // Tactic 12: Peach proximity bonus
+  {
+    for (const f of board.food) {
+      if (f.value !== FoodType.Peach) continue;
+      const dist = manhattan(next, f);
+      if (dist === 1) score += 800;
+      else if (dist === 2) score += 300;
+    }
+  }
+
+  // Tactic 13: Weak enemy hunting (myLength >= enemy.length + 3)
+  {
+    for (const enemy of enemies) {
+      if (myLength >= enemy.length + 3) {
+        const dist = manhattan(myHead, enemy.head);
+        if (dist <= 12) {
+          const distAfter = manhattan(next, enemy.head);
+          if (distAfter < dist) {
+            score += Math.min(300, (myLength - enemy.length) * 15 + (12 - dist) * 10);
+          }
+          // Check if next is adjacent to enemy head
+          if (manhattan(next, enemy.head) <= 1) {
+            const enemyObs = buildObstacles(gameState);
+            const enemyReachable = floodFill(enemy.head, enemyObs, board);
+            if (enemyReachable < enemy.length) score += 2000;
+            else if (enemyReachable < enemy.length * 2) score += 1000;
+            else score += 200;
+          }
+        }
+      }
+    }
+  }
+
+  return score;
+}
+
+// ---- Helper: Build obstacles after our move ----
+
+function buildObstaclesAfterMove(gameState: GameState, nextHead: Coord): Set<string> {
+  const obs = new Set<string>();
+  const { you, board } = gameState;
+
+  // Our new body: head at nextHead, body = old head + old body minus last
+  const newMyBody = [nextHead, ...you.body.slice(0, -1)];
+  for (let i = 1; i < newMyBody.length; i++) { // skip index 0 = our new head
+    obs.add(key(newMyBody[i]));
+  }
+
+  // Enemy bodies (minus their tails)
+  for (const snake of board.snakes) {
+    if (snake.id === you.id) continue;
+    for (let i = 0; i < snake.body.length - 1; i++) {
+      obs.add(key(snake.body[i]));
+    }
+  }
+
+  return obs;
+}
+
+// ---- Helper: Count safe exits from a position ----
+
+function countSafeExits(pos: Coord, obstacles: Set<string>, board: Board): number {
+  let count = 0;
+  for (const d of Object.values(DIRS)) {
+    const nb: Coord = { x: pos.x + d.dx, y: pos.y + d.dy };
+    if (inBounds(nb, board) && !obstacles.has(key(nb))) count++;
+  }
+  return count;
+}
+
+// ---- Helper: Compute territory score via bidirectional BFS ----
+
+function computeTerritoryScore(
+  myNext: Coord,
+  nearEnemies: Battlesnake[],
+  obstacles: Set<string>,
+  board: Board
+): number {
+  // Bidirectional BFS: expand from myNext and from all near enemy heads simultaneously
+  // Count cells each side reaches first
+  const myFrontier: Coord[] = [myNext];
+  const enemyFrontier: Coord[] = nearEnemies.map(e => e.head);
+
+  const myVisited = new Set<string>([key(myNext)]);
+  const enemyVisited = new Set<string>(enemyFrontier.map(key));
+
+  // Also mark obstacles as visited for both
+  let myCells = 0;
+  let enemyCells = 0;
+  const maxIter = board.width * board.height;
+  let myQ = [...myFrontier];
+  let eQ = [...enemyFrontier];
+
+  for (let iter = 0; iter < maxIter && (myQ.length > 0 || eQ.length > 0); iter++) {
+    // Expand one step for each
+    const nextMyQ: Coord[] = [];
+    for (const c of myQ) {
+      for (const dv of Object.values(DIRS)) {
+        const nb: Coord = { x: c.x + dv.dx, y: c.y + dv.dy };
+        const k = key(nb);
+        if (inBounds(nb, board) && !obstacles.has(k) && !myVisited.has(k) && !enemyVisited.has(k)) {
+          myVisited.add(k);
+          myCells++;
+          nextMyQ.push(nb);
+        }
+      }
+    }
+    const nextEQ: Coord[] = [];
+    for (const c of eQ) {
+      for (const dv of Object.values(DIRS)) {
+        const nb: Coord = { x: c.x + dv.dx, y: c.y + dv.dy };
+        const k = key(nb);
+        if (inBounds(nb, board) && !obstacles.has(k) && !enemyVisited.has(k) && !myVisited.has(k)) {
+          enemyVisited.add(k);
+          enemyCells++;
+          nextEQ.push(nb);
+        }
+      }
+    }
+    myQ = nextMyQ;
+    eQ = nextEQ;
+  }
+
+  let score = myCells * 3.3;
+  const total = myCells + enemyCells;
+  if (total > 0 && myCells / total > 0.55) score += 500;
+  return score;
+}
+
+// ---- Info Response ----
+
+export function info(): InfoResponse {
+  return {
+    apiversion: "1",
+    author: "ai-v4",
+    name: "Battlesnake AI v4",
+    color: "#ff4500",
+    head: "default",
+    tail: "default",
+    version: "4.0.0",
+  };
+}
+
+// ---- Main Move Function ----
+
+export function move(gameState: GameState): MoveResponse {
+  const scores: Record<string, number> = {};
+  const enemies = gameState.board.snakes.filter(s => s.id !== gameState.you.id);
+
+  for (const dir of Object.keys(DIRS)) {
+    scores[dir] = scoreMove(dir, gameState);
+
+    // Add minimax lookahead score × 0.6
+    const d = DIRS[dir];
+    const next: Coord = { x: gameState.you.head.x + d.dx, y: gameState.you.head.y + d.dy };
+    if (inBounds(next, gameState.board)) {
+      const newBody = [next, ...gameState.you.body.slice(0, -1)];
+      const newSnake: Battlesnake = {
+        ...gameState.you,
+        head: next,
+        body: newBody,
+        health: gameState.you.health - 1,
+      };
+      try {
+        const mmScore = minimax(
+          newSnake,
+          enemies.slice(0, 2), // limit for performance
+          gameState.board,
+          6,
+          -Infinity,
+          Infinity,
+          false,
+          gameState.turn + 1
+        );
+        scores[dir] += mmScore * 0.6;
+      } catch {
+        // Ignore minimax errors
+      }
+    }
+  }
+
+  const sorted = Object.entries(scores).sort((a, b) => b[1] - a[1]);
+  let best = sorted[0][0];
+  let bestScore = sorted[0][1];
+
+  // ---- Survival Fallback: 6-step lookahead ----
+  // When the best scoring direction is still a fatal move (score <= -1e8),
+  // all "normal" directions are blocked. Switch to survival mode:
+  // simulate up to 6 steps for each safe (non-instant-death) direction,
+  // pick whichever keeps us alive the longest.
+  if (bestScore <= -1e8) {
+    const survivalSteps: Record<string, number> = {};
+    const { you: fallbackYou, board: fallbackBoard } = gameState;
+    const fallbackObs = buildObstacles(gameState, fallbackYou.head);
+
+    for (const [dName, dv] of Object.entries(DIRS)) {
+      const firstStep: Coord = {
+        x: fallbackYou.head.x + dv.dx,
+        y: fallbackYou.head.y + dv.dy,
+      };
+      // Skip instantly fatal moves (out of bounds or solid obstacle)
+      if (!inBounds(firstStep, fallbackBoard) || fallbackObs.has(key(firstStep))) {
+        survivalSteps[dName] = 0;
+        continue;
+      }
+
+      // BFS-simulate up to 6 steps greedily (always pick direction with most space)
+      let simHead = firstStep;
+      // Build obstacles after first step
+      let simObs = buildObstaclesAfterMove(gameState, firstStep);
+      let steps = 1;
+
+      for (; steps < 6; steps++) {
+        // Prune: check if simHead itself has any valid neighbor before doing floodFill
+        let hasAnyExit = false;
+        for (const sdv of Object.values(DIRS)) {
+          const nb: Coord = { x: simHead.x + sdv.dx, y: simHead.y + sdv.dy };
+          if (inBounds(nb, fallbackBoard) && !simObs.has(key(nb))) {
+            hasAnyExit = true;
+            break;
+          }
+        }
+        // No exits at all — dead end, stop immediately
+        if (!hasAnyExit) break;
+
+        let bestSpace = -1;
+        let bestNext: Coord | null = null;
+        for (const sdv of Object.values(DIRS)) {
+          const nb: Coord = { x: simHead.x + sdv.dx, y: simHead.y + sdv.dy };
+          if (inBounds(nb, fallbackBoard) && !simObs.has(key(nb))) {
+            const sp = floodFill(nb, simObs, fallbackBoard);
+            if (sp > bestSpace) {
+              bestSpace = sp;
+              bestNext = nb;
+            }
+          }
+        }
+        // bestSpace === 0 means every reachable neighbor leads into a 0-cell pocket
+        if (bestNext === null || bestSpace === 0) break;
+        // Advance: add current simHead to obstacles (body moves forward)
+        simObs = new Set(simObs);
+        simObs.add(key(simHead));
+        simHead = bestNext;
+      }
+
+      survivalSteps[dName] = steps;
+    }
+
+    const survivalSorted = Object.entries(survivalSteps).sort((a, b) => b[1] - a[1]);
+    best = survivalSorted[0][0];
+    bestScore = scores[best];
+    console.log(`[SURVIVAL FALLBACK] T${gameState.turn}: survivalSteps=${JSON.stringify(survivalSteps)} => ${best}`);
+  }
+
+  // ---- Build shout debug info ----
+  const { you, board, turn } = gameState;
+  const obstacles = buildObstacles(gameState, you.head);
+  const mySpace = floodFill(you.head, obstacles, board);
+
+  // Nearest good food distance
+  const goodFoods = board.food.filter(isGoodFood);
+  let nearestFoodDist = 999;
+  let nearestFoodType = '-';
+  for (const f of goodFoods) {
+    const dist = bfsDistance(you.head, f, obstacles, board);
+    if (dist < nearestFoodDist) {
+      nearestFoodDist = dist;
+      nearestFoodType = f.value === FoodType.Peach ? '🍑' : '🥟';
+    }
+  }
+
+  // Enemy info: closest enemy
+  const aliveEnemies = board.snakes.filter(s => s.id !== you.id);
+  let closestEnemyDist = 999;
+  let closestEnemyLen = 0;
+  let closestEnemyRelSize = '?';
+  for (const e of aliveEnemies) {
+    const d = manhattan(you.head, e.head);
+    if (d < closestEnemyDist) {
+      closestEnemyDist = d;
+      closestEnemyLen = e.length;
+      closestEnemyRelSize = you.length > e.length + 2 ? '↑' : you.length < e.length - 2 ? '↓' : '='
+    }
+  }
+
+  // Score ranking: show direction scores compactly
+  const scoreStr = sorted
+    .map(([d, s]) => `${d[0].toUpperCase()}:${Math.round(s)}`)
+    .join(' ');
+
+  const shout = [
+    `T${turn}`,
+    `HP:${you.health}`,
+    `L:${you.length}`,
+    `SP:${mySpace}`,
+    `F${nearestFoodType}:${nearestFoodDist === 999 ? '-' : nearestFoodDist}`,
+    aliveEnemies.length > 0 ? `E${closestEnemyRelSize}:${closestEnemyDist}(${closestEnemyLen})` : 'NoE',
+    `>${best.toUpperCase()}(${Math.round(bestScore)})`,
+    scoreStr,
+  ].join(' | ');
+
+  console.log(`MOVE ${turn}:`, scores, `=> ${best}`);
+  return { move: best, shout };
+}
