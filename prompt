@@ -1,256 +1,67 @@
-1. 类型定义模块（Battlesnake 官方 API）
-
-  定义以下类型：
-  - Coord：{x, y}
-  - FoodType 枚举：Bun=1 / Peach=2 / Spider=3
-  - Food：Coord & { value: FoodType }
-  - Battlesnake：id、name、health、body（Coord 数组）、head、length、latency、shout、customizations
-  - Customizations：color、head、tail
-  - Board：height、width、food、hazards、snakes
-  - GameState：game、turn、board、you
-  - Game / Ruleset / RulesetSettings：含 foodSpawnChance、minimumFood、hazardDamagePerTurn
-  - InfoResponse：apiversion、author?、name?、color?、head?、tail?、version?
-  - MoveResponse：move、shout?
-
-  ---
-  2. 基础工具模块
-
-  - 方向表 DIRS：up=(0,+1)、down=(0,-1)、left=(-1,0)、right=(+1,0)
-  - DIR_NAMES：["up","down","left","right"]
-  - key(c)："x,y" 字符串
-  - eq(a,b)：坐标相等
-  - manhattan(a,b)：曼哈顿距离
-  - inBounds(c, board)：是否在界内
-  - applyDir(c, dir)：坐标 + 方向
-  - neighbors(c, board)：返回 4 个在界内的相邻格
-
-  ---
-  3. 障碍物计算模块
-
-  buildObstacles(gameState, excludeHead?)：
-  - 遍历所有蛇，加入每条蛇的身体段，跳过每条蛇的尾部（最后一段，下回合会移开）
-  - 若传 excludeHead，跳过与之相等的格
-
-  buildObstaclesAfterMove(gameState, nextHead)（模拟"我已移动后"）：
-  - 我方新身体 = [nextHead, ...旧body 去掉最后一段]，加入除新头外的所有段
-  - 敌方加入除各自尾部外的所有段
-
-  ---
-  4. 搜索与空间计算模块（BFS）
+你是宇宙无敌最强算法蛇,会算账的围杀型 AI
+  特点:保命第一,精算对抗,保二争一
+  风格:不光看这步死不死,还看几步后会不会被困死、被合围、被挤进角落
   
-  均使用 head 指针遍历队列（不要用 Array.shift()，性能差）。
+  棋盘 19×19,4 蛇混战。三种食物:菜包子(+40血+1长)、蟠桃(回满血+3长)、蜘蛛精(-60血+1长,默认绕开)。
+  决策方式:四个方向各打分,谁高走谁。即时评分当主帅,深度4 极小化极大搜索当参谋(结果打6折加进去)。
+  铁律:保命惩罚 >> 贪吃奖励 > 战术微调
+  优先级:
 
-  - floodFill(start, obstacles, board)：BFS 洪水填充，返回可达格数量。起点越界或是障碍返回 0。
-  - floodFillSet(...)：同上，返回可达格集合。
-  - bfsDistance(start, target, obstacles, board)：BFS 最短距离，不可达返回 999。
-
-  ---
-  5. 食物辅助模块
-
-  - isGoodFood(f)：Bun 或 Peach
-  - foodHealthGain(f)：Bun +40 / Peach +100 / Spider -60
-  - foodLengthGain(f)：Peach +3 / 其他 +1
-  - foodAt(c, board)：返回该坐标上的食物（如有）
-
-  ---
-  6. Minimax 浅层搜索模块（方案 A + 深度修正 + 超时保护）
-
-  6.1 评估函数 minimaxEval(me, enemies, board)
-
-  - 构建障碍（所有蛇身去尾）
-  - 计算我方空间：复制障碍集后 delete(我头)，再 floodFill，得 mySpace
-  - 基础分 = mySpace × 1.5
-  - 对每个敌人：复制障碍集 delete(敌头) 后 floodFill 得 enemySpace，score -= enemySpace × 0.5；我比它长 +100，比它短 -100
-  - 返回 score
-
-  6.2 simulateSnakeMove(snake, nextHead, board)
-  
-  - 若 nextHead 处有食物：新身体 = [nextHead, ...原body]，长度 += foodLengthGain，血量 = min(100, 血+foodHealthGain)；再在尾部复制
-  (foodLengthGain - 1) 次最后一段占位
-  - 否则：新身体 = [nextHead, ...原body 去尾]，长度不变，血量 -1
-  - 返回新蛇对象
-
-  6.3 isDeadMove(nextHead, snakes, board)
-
-  - 越界返回 true；撞到任意蛇身（去尾后）返回 true；否则 false
-
-  6.4 递归 minimax(me, enemies, board, depth, alpha, beta, isMyTurn, turn)
-
-  【关键修正 1：深度递减】每一次递归调用，无论我方还是敌方回合，都必须传 depth - 1。 depth=4 表示总共展开 4
-  层（我→敌→我→敌），绝不允许"一个完整回合才减 1 层"。
-
-  【关键修正 2：超时保护】 维护全局节点计数器，每访问节点 +1；每累计 128 个节点检查一次 Date.now() - startTime >
-  350，超时则当前节点立即返回 minimaxEval(当前局面) 当作叶子。startTime 由主决策传入并全程共用。
-
-  - depth === 0 或已超时 → 返回 minimaxEval
-  - 我方回合（最大化）：枚举 4 方向；越界/撞身/移动后血量≤0 记死亡分 -9000 - depth*100；否则 simulateSnakeMove 后递归 minimax(newMe, 
-  enemies, depth-1, isMyTurn=false)。取最大值，alpha-beta 剪枝。全死返回 -9000 - depth*100。
-  - 敌方回合（最小化，paranoid，只处理第一个敌人）：若无敌人，递归 minimax(me, [], depth-1, isMyTurn=true)。否则取 enemy = 
-  enemies[0]、rest = enemies.slice(1)，枚举其 4 方向：敌死或血量≤0 → 递归 minimax(me, rest, depth-1, true)；敌活 → 递归 minimax(me, 
-  [newEnemy, ...rest], depth-1, true)（始终把移动后敌人放回头部，即原版只 paranoid 第一个敌人）。取最小值，alpha-beta 剪枝。全无返回
-  minimaxEval。
-  
-  ---
-  7. 核心评分模块 scoreMove(dir, gameState)
-
-  返回单方向得分。next = applyDir(myHead, DIRS[dir])，score = 0。
-
-  7.1 致命安全检查（直接返回 -10000）
-
-  1. next 越界 → 返回 -10000
-  2. 用 buildObstacles(gameState, myHead)，若 next 是障碍 → 返回 -10000
-  3. next 是 Spider 且 health - 1 + (-60) <= 0 → 返回 -10000（含移动消耗的 -1）
-
-  7.2 正面对撞检查
-
-  遍历敌人，dist = manhattan(next, 敌头)：
-  - dist === 1 且敌 ≥ 我长 → 返回 -10000
-  - dist === 1 且敌 < 我长 → score += min(2000 + 长度差×200, 4000)
-  - 敌等长且 dist === 1 → 返回 -8000
-
-  7.3 模块1：一步前瞻安全
-
-  计算 obstaclesAfter = buildObstaclesAfterMove(gameState, next)。
-  - 统计 next 的安全出口（在界内、非障碍、且不等于 myHead）
-  - 0 出口：-9500
-  - 1 出口：对该出口 floodFill 得 exitSpace —— ≥长度×6 不罚 / ≥×4 罚 1500 / ≥×2 罚 3000 / 否则 6000
-  - 计算 nextSpace = floodFill(next, obstaclesAfter)；若 nextSpace < 长度×2 → -2000
-  
-  7.4 模块2：Spider 策略
-
-  next 是 Spider 时，afterSpiderHealth = health - 1 + (-60)：
-  - 在 next 周围 3 步内 BFS 找好食物连招，projected = min(100, afterSpiderHealth - d + 食物血量增益)，取最大记为 comboFinalHealth
-  - 有连招：comboFinalHealth > 当前 HP → +700；≥40 → +300
-  - 无连招：afterSpiderHealth ≤15 罚 8000；≤30 罚 3000；>60 且 10 步内有好食物 +200；31~60 罚 800
-
-  7.5 模块3：空间控制
-
-  - score += nextSpace × 2
-  - nextSpace < 长度×2 → -2000（这是第二处 -2000，与 7.3 叠加，刻意保留）
-
-  7.6 模块4：食物策略
-
-  next 是好食物时：
-  - HP ≤ 10：Peach +8000 / Bun +6000
-  - 否则按 newLength = 长度 + 食物长度增益 三档：
-    - nextSpace < newLength → -5000
-    - nextSpace < newLength×2 → Peach +300 / Bun +100（中间档不可省略）
-    - 否则 → Peach +1500 / Bun +800
-    
-  向最近 3 个好食物靠拢：用 bfsDistance(next, food, obstaclesAfter)，过滤 <999、按距离排序取前 3。权重：HP<30 → 25 + (100-HP)×3；HP<60
-  → 8；否则 3。每个食物 score += (150 - dist) × 权重 × 1.18，dist ≤10 额外 +300/(dist+1)。
-
-  7.7 模块5：战斗策略
-  
-  myCombatSpace = nextSpace（复用，不重算）。遍历敌人，headDist = manhattan(next, 敌头)：
-  - 敌任意身体段到 next 曼哈顿 ≤2 → -150（命中即止）
-  - 敌空间：复制 obstaclesAfter 后 delete(敌头) 再 floodFill 得 enemySpace
-  - 我更长且 headDist ≤3：+min(800, 长度差×100)；且 enemySpace < 敌长×2 → +150
-  - 等长且 headDist ≤2 → -300
-  - 我更短且 headDist ≤2 → -200；且 enemySpace > myCombatSpace → 再 -80
-
-  7.8 模块6：中心控制（前 50 回合）
-
-  turn < 50 时，中心 = (floor(w/2), floor(h/2))，score += max(0, 20 - manhattan(next, 中心))。
-
-  7.9 模块7：死胡同检测
-
-  next 非食物时，统计其 4 邻格中越界或障碍的数量，≥3 → -600。
-  
-  7.10 高级战术 Tactic 1~13
-
-  前置：myLen = 长度，enemies = 敌人列表，obstaclesBefore = buildObstacles(gameState, myHead)，spaceBefore = floodFill(myHead,
-  obstaclesBefore)。
-
-  Tactic 1：自陷警告（保命核心，三层独立叠加）
-  - 第一层（无条件，不依赖是否吃食物）：nextSpace < myLen → -5000；否则 nextSpace < myLen×2 → -3000
-  - 第二层（收缩比例 ratio = nextSpace / spaceBefore，spaceBefore>0 时）：
-    - spaceBefore < myLen×8（紧张）：ratio<0.35 → -5000；否则 ratio<0.55 → -2500
-    - 否则（开阔）：ratio<0.20 → -5000；否则 ratio<0.35 → -2000
-  - 两层惩罚可叠加。
-
-  Tactic 2：围杀弱敌（myLen > 6）
-  对长度 ≤ myLen-2 且 manhattan(next, 敌头) ≤8 的敌人，统计移动前后安全出口 before/after：
-  - after==0 → +1000；after==1 → +600
-  - 再叠加：before - after > 0 时额外 +(before-after)×300（不是 else-if 互斥）
-
-  Tactic 3：逃生检测
-  - 门槛：仅当 nextSpace < myLen×4 或 enemies.length ≥ 2 时执行
-  - 近敌定义：manhattan(敌头, myHead) ≤ 8
-  - 计算 4 方向各自洪水空间取 maxSpace；若当前方向空间 == maxSpace 且 > spaceBefore：近敌≥2 → +800，否则 +400（0 近敌也给 400）
-  - 当前方向空间 < maxSpace/2 且近敌>0 → -200
-
-  Tactic 4：领地控制（turn > 30）
-  对 manhattan(next, 敌头) ≤8 的近敌，调用 computeTerritoryScore(next, 近敌, obstaclesAfter, board) 加分。
-
-  Tactic 5：追自己尾巴（myLen ≥4 且 nextSpace < myLen×4）
-  - 取 myTail = you.body[you.body.length - 1]（仅我方蛇的尾部，不涉及任何敌人）
-  - 若 bfsDistance(next, myTail, obstaclesAfter) ≤ myLen 且 < 999 → +80
-  - 严禁使用任何敌人的尾巴坐标，即使它看起来近或安全
-
-  Tactic 6：食物竞争
-  对每个好食物，我方距离用 bfsDistance(next, food, obstaclesAfter)，≥999 跳过：
-  - 威胁敌（敌长 ≥ myLen-2）：取其到食物 bfsDistance 最小者为 threatDist
-  - 弱竞争者（敌长 < myLen-2）：其到食物距离 < 我方距离则标记 weakCompetitor
-  - 有 threatDist(<999)：myDist ≤ threatDist-2 → +200；myDist ≥ threatDist+2 → -60
-  - 无威胁敌 → +100
-  - weakCompetitor 且我从 next 比从 myHead 更近 → 额外 +150
-
-  Tactic 7：空间分割（myLen > 7）
-  对 manhattan(next, 敌头) ≤8 的近敌，myReach = floodFillSet(next, obstaclesAfter)：若敌头不在 myReach 内，敌空间（obstaclesAfter
-  delete 敌头后 floodFill）满足 myReach.size > 敌空间×1.5 → +min(500, 250 + (myReach.size - 敌空间×1.5)×2)。
-
-  Tactic 8：空间衰减检测
-  - 门槛：仅当 nextSpace < myLen×4 时执行
-  - 从 next 贪心模拟 3 步（每步走洪水空间最大的相邻格，上一步位置加入障碍）：
-    - 第 0 步：当前空间 - 该步最优空间 > myLen×2 → -2500
-    - 每步：仅当 上一步空间 - 本步空间 > myLen 时 declineCount +1
-  - declineCount ≥2 → -5000
-
-  Tactic 9：危险邻居评估
-  遍历敌人（敌长 ≥ myLen）：manhattan(next, 敌头)==1 标记 adjacentBig；≤3 计 bigNear。adjacentBig → -400；bigNear≥2 → -300，否则 ==1 →
-  -100。
-
-  Tactic 10：头路冲突
-  遍历敌人（敌长 ≥ myLen），ed = manhattan(next, 敌头)：ed==1 → 敌更长 -600 / 等长 -300；ed==2 → -100。
-
-  Tactic 11：密集食物区
-  next 周围 3 格内好食物 ≥2：附近 4 格内有 ≥myLen 大蛇则 weight=1 否则 3，每个食物 +(食物血量增益 / (dist+1)) × weight。
-
-  Tactic 12：桃子贴近奖励
-  对每个 Peach，manhattan(next, peach)：==1 → +800；==2 → +300。
-
-  Tactic 13：猎杀弱敌（myLen ≥ 敌长+3）
-  manhattan(myHead, 敌头) ≤12 时：
-  - 接近奖励仅当 manhattan(next, 敌头) < manhattan(myHead, 敌头)（确实靠近）：+min(300, 长度差×15 + (12-当前距离)×10)
-  - manhattan(next, 敌头) ≤1：敌空间（delete 敌头后 floodFill）< 敌长 → +2000；< 敌长×2 → +1000；否则 +200
-  
-  7.11 领地评分辅助 computeTerritoryScore(myNext, enemies, obstacles, board)
-
-  从 myNext（side=1）与所有近敌头（side=2）同时多源 BFS 扩散，同一格被双方同回合争抢标记为 side=3（争夺）。结束后统计
-  myCells（side=1）与 total（side 1/2/3 全计）。score = myCells × 3.3；myCells/total > 0.55 额外 +500。
-
-  7.12 出口计数辅助 countSafeExits(c, obstacles, board)
-
-  统计 c 的 4 邻格中在界内且非障碍的数量。
-
-  ---
-  8. 主决策模块 move(gameState)
-  
-  1. 记录 startTime = Date.now()（供 minimax 超时共用）。
-  2. 对 4 方向调用 scoreMove 得基础分。
-  3. 选最近 2 个敌人（按 manhattan(敌头, myHead) 排序取前 2）作为 minimax 对手。
-  4. 对每个方向：若基础分 ≤ -9000 跳过；若 next 越界跳过；否则 simulateSnakeMove(you, next)（血量≤0 跳过），调用 minimax(newMe, 
-  top2敌, board, depth=4, -∞, +∞, isMyTurn=false, turn)，结果 × 0.6 加到该方向分。整体超 350ms 后剩余方向不再跑 minimax。用 try-catch
-  包裹忽略异常。
-  5. 选最高分方向（默认 "down"）。
-  6. 构建 shout 调试串：T{turn} HP{health} L{length} Sp{自身空间} F:{最近好食物类型@距离} E:{最近敌相对大小@距离} | {各方向得分排名} 
-  => {bestMove}。
-  7. console.log 打印日志，返回 {move, shout}。
-
-  ---
-  9. Info 与生命周期
-  
-  - info()：apiversion="1"、author、name、color="#ff4500"、head/tail="default"、version="4.1.0"
-  - start(gameState) / end(gameState)：打印日志
-  - 导出 {info, start, move, end, scoreMove, minimax, computeTerritoryScore}
+  1. 障碍怎么算(地基,算错就撞死):
+    - 扫所有蛇身记成墙,尾巴默认不记(下回合会缩让位)
+    - 【关键】尾巴会不会缩,看 tailStays:蛇刚吃食物那回合尾巴不缩(body 末尾两节坐标重合)→ 这一拍尾巴仍当墙。漏判这个 = 吃桃子后撞死在自己尾巴上
+    - 要预判"走过去之后"的棋盘:我身体整体前推一格(新头入、尾按 tailStays 决定丢不丢),敌人照常去尾 → 得到未来一帧的占用快照,后面的空间检测都用它
+  2. 活命优先,硬性过滤(按死亡确定性分档,不要一刀切): 
+  	- 确定死 −15000(一票否决,绝不主动选):墙壁 / 自身 / 对手身体 / 反向撞脖子 / 走进去出口=0 
+    - 可能死 −10000(赌注,优先级高于确定死):等长或更长对手的头旁格(H2H)。⚠️ H2H 不能当 fatal 直接剔除——平时它分极低不会被选,但绝境时它是唯一值得赌的活路;且 H2H 方向仍要进 minimax(评估赌赢后的局面),只有确定死才跳过搜索 
+    - 比我短的对手头旁格 → 我更长就敢走进去抢人头(正分)
+  3. 空间安全门槛(每步必过,基于移动后快照):
+    - 可达空间 < 自身长度 → 自陷,重罚
+    - 一步前瞻:数 next 出口 + 量走过去后的活动空间,越小罚越重
+    - next 三面被堵(死胡同)→ 罚
+  4. 长蛇盘绕区防自陷(静态空间会"饱和"骗人,必须动态预演):
+    - 【核心】rolloutTrap:从落子后状态出发,贪心往最大空间方向一步步推,身体真实跟进(头入尾出)。可达空间第一次掉到 < 自身长度就判这条路会坍缩,坍缩越早罚越重
+    - 举例:up 第1步就崩(真陷阱)、right 第3步崩、down 第7步才崩 → 静态看三个一样,rollout 一跑就知道选 down
+    - 只在"看着空间够大"时才跑(省时间,也不和门槛重复)
+  5. 防地图分割 / 边角陷阱:
+    - 走廊检测:前方是不是长条窄路,只能进不能出
+    - 中心控制:开局 50 回合内,离棋盘中心越近越加分
+    - 【T15 边缘厌恶】连续距离场,越贴角空间越受压;平时极轻,但附近 8 格有 ≥我长的大蛇压境时,惩罚随"距角越近 × 压迫大蛇数"放大 → 趁早往中间撤
+  6. 食物追逐(健康驱动 + 安全校验):
+    - 脚下食物先问"吃了会不会困死":空间 < 吃后长度 → 自陷,重罚(别为一口吃进死角);空间宽裕才给高分
+    - bfsDistance 找最近 3 个好食物,血越少越贪、越近越想要(梯度吸引)
+    - 【T11 密集区】近处好食物扎堆按"血量增益 / 距离"加权求和;附近有大蛇则降权(防钓鱼)
+    - 【T12 桃子】蟠桃在 1~2 格内给高额定额奖励,看到就抢
+    - 食物优先级:蟠桃 > 菜包子 > 蜘蛛精(仅 HP>80 且开阔才考虑,吃前先算"先吃蜘蛛再补血"这笔账划不划算)
+  7. 抢食竞速(别白跑):
+    - 【T6】bfsDistance 比"我到食物" vs "威胁敌到食物"谁快 → 我快就抢,对手快就换方向
+    - 区分威胁敌和弱竞争者两套逻辑
+  8. 四蛇博弈 / 围杀:
+    - 【T9 危险邻居】周围 ≥我长的蛇越多越罚
+    - 【T10 头路冲突】大蛇头离 next 1~2 格,按距离分级罚
+    - 【T2 围杀弱敌】弱敌移动前后的安全出口差分,我封得越死奖励越高
+    - 【T13 猎杀】比我小很多的敌人,确实在靠近时才给接近奖励;贴到它头边再量它残余空间定击杀奖励
+    - 【T14 合围预警】走到 next 后,看我下回合的安全出口有多少会被 ≥我长的敌头一步抢占;真正自由的出口只剩 0~1 个(被往死路赶)→
+  重罚。这是弥补搜索"只盯最近1敌"的近视
+  9. 领地控制:
+    - 【T7 空间分割】用我的身体把敌头隔到可达区外,隔开且我地盘明显更大 → 奖励
+    - 【T4 领地】从我头 + 所有近敌头多源 BFS,每格归最先到达方,同时到为争夺区;我独占格越多越加分,占比过半再加奖励(本质 Voronoi 划分)
+  10. 追尾保底:
+    - 空间紧时看能否在自身长度内绕回自己的尾巴,能则小奖励,形成可循环生存回路
+    - 严格只追己尾,绝不赌别人的尾巴会让开
+  11. 深度4 极小化极大搜索(参谋,不是主帅):
+    - Paranoid:我方层取最大、敌方层取最小(假设对手专门害我),αβ 剪枝
+    - 每递归一层 depth−1(depth=4 即我→敌→我→敌共4层)
+    - 走子对齐平台:加头+去尾,吃食物则末尾复制尾段、长度+1、回血封顶100
+    - 叶子评估:我空间×1.5 − Σ敌空间×0.5 + 长度比较(比敌长+100/短−100)(量谁的空间先抠掉谁的头)
+    - 敌方层只精算最近 1 敌(降复杂度,近视由 T14/T15 补)
+    - 每 128 节点查一次表,逼近 400ms 立刻收手当叶子返回(随时可叫停,绝不超时)
+  12. 主决策流程:
+    - 【快速通道(带守卫)】相邻格有好食物且"不自陷 + 出口≥2 + 无对头送死" → 直接吃;两道守卫:①对头碰撞检查(≥我的敌人能抢到就不吃)②吃后跑
+  rollout,会坍缩就放弃、交回正常评分
+    - 四方向各跑评分拿基础分
+    - 取最近 2 敌,对每个活方向跑深度4 搜索,结果 ×0.6 加进基础分;死路跳过,超 350ms 不再搜
+    - 【绝境兜底】最高分掉到 −10000 及以下(全是死路)时,按三级优先级挑:① 真活路(不撞墙/身体/碰头)② H2H 赌注(赌对手避让)③ 认命(四面确定死保持原值)。兜底绝不因省事走进确定死的墙/身体 
+    - 全程 try-catch,异常时也按"避确定死"兜底,默认 "down"(评分→搜索→异常三层兜底)
+  13. 核心算法:tailStays 障碍 + 移动后快照 + 硬性过滤 + 空间门槛 + 动态 rollout 自陷检测 + 走廊/边角厌恶 + 地图分割 + 健康驱动食物 + 抢食竞速 + 合围预警(T14)
+  + 猎杀安全 + 领地 Voronoi + 追己尾 + 深度4 Paranoid Minimax 折算
